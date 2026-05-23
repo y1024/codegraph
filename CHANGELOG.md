@@ -7,6 +7,25 @@ a [GitHub Release](https://github.com/colbymchenry/codegraph/releases) tagged
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **`CODEGRAPH_MCP_TOOLS` — trim the exposed MCP tool surface.** Set it to a
+  comma-separated list of tool names (e.g. `trace,search,node,context`) to expose
+  only those codegraph tools over MCP; unset exposes all of them. Names match on
+  the short form, so `trace` and `codegraph_trace` are equivalent. Lets you
+  constrain an agent to a minimal surface (or A/B-test tool selection) without
+  editing the client's MCP config. Inert by default.
+
+### Changed
+- **`codegraph_trace` now returns a self-contained flow dossier.** Each hop on
+  the path is shown with its full body inline (previously just the call-site
+  line), and the destination's own outgoing calls are appended — so one trace
+  call usually answers a "how does X reach Y" flow question without a follow-up
+  `codegraph_explore`/`codegraph_node`/Read. Measured across real repos: fewer
+  tool calls and lower cost than the prior path-only output, with no wall-clock
+  regression.
+
 ## [0.9.4] - 2026-05-22
 
 ### Fixed

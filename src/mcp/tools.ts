@@ -501,7 +501,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_trace',
-    description: 'Trace the CALL PATH between two symbols — "how does <from> reach/become <to>?" Returns the chain of functions from one to the other (each hop with file:line + the call-site line) in ONE call. This is something grep/Read structurally cannot do: there is no text pattern for "the path from A to B". Ideal for flow questions — how an update triggers a render, how a request reaches a handler, how a QuerySet becomes SQL. If no static path exists the chain likely breaks at dynamic dispatch (callbacks/descriptors/metaclasses); the tool says where and points you to codegraph_node to bridge it.',
+    description: 'Trace the CALL PATH between two symbols — "how does <from> reach/become <to>?" Returns the chain of functions from one to the other (each hop with file:line and its body inlined, plus the outgoing calls of the destination itself) in ONE call. This is something grep/Read structurally cannot do: there is no text pattern for "the path from A to B". Ideal for flow questions — how an update triggers a render, how a request reaches a handler, how a QuerySet becomes SQL. If no static path exists the chain likely breaks at dynamic dispatch (callbacks/descriptors/metaclasses); the tool says where and points you to codegraph_node to bridge it.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -558,18 +558,45 @@ export class ToolHandler {
   }
 
   /**
+   * Optional allowlist of exposed tools, parsed from the CODEGRAPH_MCP_TOOLS
+   * env var (comma-separated short names, e.g. "trace,search,node,context").
+   * Unset/empty → every tool is exposed. Lets an operator (or an A/B harness)
+   * trim the tool surface without rebuilding the client config; the ablated
+   * tool is then truly absent from ListTools rather than merely denied on call.
+   * Matching is on the short form, so "trace" and "codegraph_trace" both work.
+   */
+  private toolAllowlist(): Set<string> | null {
+    const raw = process.env.CODEGRAPH_MCP_TOOLS;
+    if (!raw || !raw.trim()) return null;
+    const short = (s: string) => s.trim().replace(/^codegraph_/, '');
+    const set = new Set(raw.split(',').map(short).filter(Boolean));
+    return set.size ? set : null;
+  }
+
+  /** Whether a tool name passes the CODEGRAPH_MCP_TOOLS allowlist (if any). */
+  private isToolAllowed(name: string): boolean {
+    const allow = this.toolAllowlist();
+    return !allow || allow.has(name.replace(/^codegraph_/, ''));
+  }
+
+  /**
    * Get tool definitions with dynamic descriptions based on project size.
    * The codegraph_explore tool description includes a budget recommendation
-   * scaled to the number of indexed files.
+   * scaled to the number of indexed files. Honors the CODEGRAPH_MCP_TOOLS
+   * allowlist so a trimmed surface is reflected in ListTools.
    */
   getTools(): ToolDefinition[] {
-    if (!this.cg) return tools;
+    const allow = this.toolAllowlist();
+    const visible = allow
+      ? tools.filter(t => allow.has(t.name.replace(/^codegraph_/, '')))
+      : tools;
+    if (!this.cg) return visible;
 
     try {
       const stats = this.cg.getStats();
       const budget = getExploreBudget(stats.fileCount);
 
-      return tools.map(tool => {
+      return visible.map(tool => {
         if (tool.name === 'codegraph_explore') {
           return {
             ...tool,
@@ -579,7 +606,7 @@ export class ToolHandler {
         return tool;
       });
     } catch {
-      return tools;
+      return visible;
     }
   }
 
@@ -720,6 +747,11 @@ export class ToolHandler {
    */
   async execute(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
     try {
+      // Honor the optional tool allowlist (CODEGRAPH_MCP_TOOLS): a trimmed
+      // surface rejects ablated tools defensively even if a client cached them.
+      if (!this.isToolAllowed(toolName)) {
+        return this.errorResult(`Tool ${toolName} is disabled via CODEGRAPH_MCP_TOOLS`);
+      }
       // Cross-cutting input validation. All tools accept an optional
       // `projectPath` and most accept either `query`, `task`, or
       // `symbol` — bound their lengths centrally so individual handlers
@@ -1044,11 +1076,19 @@ export class ToolHandler {
       return this.textResult(lines.join('\n') + fromMatches.note + toMatches.note);
     }
 
-    const lines: string[] = [`## Trace: ${from} → ${to}`, '', `${path.length} hops:`, ''];
-    // Inline the evidence each hop needs so the agent doesn't Read/Grep to get it:
-    // the call-site source line for static calls, and — for dynamic-dispatch hops
-    // bridged by callback synthesis — where the callback was registered. (This is
-    // exactly what agents grepped for under a Read-0 constraint.)
+    const lines: string[] = [
+      `## Trace: ${from} → ${to}`,
+      '',
+      `Full execution path below — ${path.length} hops, each with its body, plus what the destination calls. This is the complete flow; answer from it.`,
+      '',
+      `${path.length} hops:`,
+      '',
+    ];
+    // Inline what each hop needs so the agent doesn't Read/Grep to get it: the
+    // call-site source line, the registration site for dynamic-dispatch hops, AND
+    // the hop's own body (capped per hop so the trace stays path-scoped). Earlier
+    // versions inlined only the call-site line, which left agents calling explore
+    // or Read for the bodies — the exact follow-up the ablation experiment measured.
     const fileCache = new Map<string, string[]>();
     for (let i = 0; i < path.length; i++) {
       const step = path[i]!;
@@ -1068,9 +1108,27 @@ export class ToolHandler {
           lines.push(`   ↓ ${step.edge.kind}${step.edge.line ? `@${step.edge.line}` : ''}${callSrc ? `   ${callSrc}` : ''}`);
         }
       }
-      lines.push(`${i + 1}. ${step.node.name} (${step.node.filePath}:${step.node.startLine})`);
+      lines.push(`${i + 1}. ${step.node.name} (${step.node.filePath}:${step.node.startLine}-${step.node.endLine})`);
+      const body = this.sourceRangeAt(cg, step.node.filePath, step.node.startLine, step.node.endLine, fileCache, 60, 1800);
+      if (body) lines.push(body);
     }
-    lines.push('', '> Each hop shows its call-site source line (and, for dynamic-dispatch hops, where the callback was registered) — no Read needed. codegraph_node a hop only for its full body.');
+    // The "last mile": what the destination does next. Agents otherwise explore/Read
+    // for exactly this (e.g. renderStaticScene → _renderStaticScene → the canvas draw),
+    // so inlining the destination's callees is what actually stops the investigation —
+    // sufficiency, not a "don't explore" instruction.
+    const dest = path[path.length - 1]!.node;
+    const destCallees = cg.getCallees(dest.id)
+      .filter(c => !path.some(p => p.node.id === c.node.id))
+      .slice(0, 6);
+    if (destCallees.length > 0) {
+      lines.push('', `### \`${dest.name}\` then calls (the destination's immediate work):`);
+      for (const c of destCallees) {
+        lines.push('', `- ${c.node.name} (${c.node.filePath}:${c.node.startLine}-${c.node.endLine})`);
+        const body = this.sourceRangeAt(cg, c.node.filePath, c.node.startLine, c.node.endLine, fileCache, 16, 600);
+        if (body) lines.push(body);
+      }
+    }
+    lines.push('', '> Full path + every hop body + the destination\'s calls are inlined above — the complete flow. Answer from it; a Read is only needed to chase a specific local variable\'s data-flow.');
     return this.textResult(this.truncateOutput(lines.join('\n')));
   }
 
@@ -1151,6 +1209,45 @@ export class ToolHandler {
     if (raw == null) return null;
     const t = raw.trim();
     return t.length > 160 ? t.slice(0, 157) + '…' : t;
+  }
+
+  /**
+   * Read a hop's body — filePath lines [startLine..endLine] — for inlining into
+   * a trace, capped (lines + chars) so the whole path stays path-scoped even on
+   * a 7-hop chain. Dedents to the body's own indentation and marks truncation.
+   * Shares `cache` with sourceLineAt so each file is read at most once per trace.
+   */
+  private sourceRangeAt(
+    cg: CodeGraph,
+    filePath: string,
+    startLine: number,
+    endLine: number,
+    cache: Map<string, string[]>,
+    maxLines = 28,
+    maxChars = 1200
+  ): string | null {
+    if (!Number.isFinite(startLine) || startLine < 1) return null;
+    let fileLines = cache.get(filePath);
+    if (!fileLines) {
+      const abs = validatePathWithinRoot(cg.getProjectRoot(), filePath);
+      if (!abs || !existsSync(abs)) return null;
+      try { fileLines = readFileSync(abs, 'utf-8').split('\n'); } catch { return null; }
+      cache.set(filePath, fileLines);
+    }
+    const end = Number.isFinite(endLine) && endLine >= startLine ? endLine : startLine;
+    let slice = fileLines.slice(startLine - 1, end);
+    if (slice.length === 0) return null;
+    let omitted = 0;
+    if (slice.length > maxLines) { omitted = slice.length - maxLines; slice = slice.slice(0, maxLines); }
+    const nonBlank = slice.filter(l => l.trim().length > 0);
+    const dedent = nonBlank.length ? Math.min(...nonBlank.map(l => l.length - l.trimStart().length)) : 0;
+    let text = slice.map(l => `      ${l.slice(dedent)}`).join('\n');
+    if (text.length > maxChars) {
+      text = text.slice(0, maxChars).replace(/\n[^\n]*$/, '');
+      omitted = Math.max(omitted, 1);
+    }
+    if (omitted > 0) text += `\n      … (+${omitted} more line${omitted === 1 ? '' : 's'})`;
+    return text;
   }
 
   /**
