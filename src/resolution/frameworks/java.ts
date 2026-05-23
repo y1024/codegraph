@@ -10,7 +10,7 @@ import { stripCommentsForRegex } from '../strip-comments';
 
 export const springResolver: FrameworkResolver = {
   name: 'spring',
-  languages: ['java'],
+  languages: ['java', 'kotlin'],
 
   detect(context: ResolutionContext): boolean {
     // Check for pom.xml with Spring
@@ -119,10 +119,14 @@ export const springResolver: FrameworkResolver = {
   },
 
   extract(filePath, content) {
-    if (!filePath.endsWith('.java')) return { nodes: [], references: [] };
+    // Spring Boot is used from both Java and Kotlin (identical @GetMapping etc.
+    // annotations); the difference is method syntax — Kotlin `fun name(...)` vs
+    // Java `public X name(...)` — handled in the method regex below.
+    if (!filePath.endsWith('.java') && !filePath.endsWith('.kt')) return { nodes: [], references: [] };
     const nodes: Node[] = [];
     const references: UnresolvedRef[] = [];
     const now = Date.now();
+    const lang: 'java' | 'kotlin' = filePath.endsWith('.kt') ? 'kotlin' : 'java';
     const safe = stripCommentsForRegex(content, 'java');
 
     // Class-level @RequestMapping prefix (an @RequestMapping whose tail leads to a
@@ -130,7 +134,7 @@ export const springResolver: FrameworkResolver = {
     // route itself (the old regex did, creating one bogus class route and missing
     // every BARE method mapping like `@PostMapping` with the path on the class).
     let classPrefix = '';
-    const cls = /@RequestMapping\s*\(([^)]*)\)\s*(?:@[\w.]+(?:\([^)]*\))?\s*)*(?:public\s+|final\s+|abstract\s+)*class\b/.exec(safe);
+    const cls = /@RequestMapping\s*\(([^)]*)\)\s*(?:@[\w.]+(?:\([^)]*\))?\s*)*(?:public\s+|final\s+|abstract\s+|open\s+|data\s+|sealed\s+)*class\b/.exec(safe);
     if (cls) classPrefix = parseMappingPath(cls[1]!);
 
     const VERB: Record<string, string> = {
@@ -154,7 +158,7 @@ export const springResolver: FrameworkResolver = {
         endLine: line,
         startColumn: 0,
         endColumn: match[0].length,
-        language: 'java',
+        language: lang,
         updatedAt: now,
       };
       nodes.push(routeNode);
@@ -162,16 +166,16 @@ export const springResolver: FrameworkResolver = {
       // Method it decorates: first declared method after (skip stacked annotations;
       // Java puts the return type before the name). Bounded so we don't grab a far one.
       const tail = safe.slice(match.index + match[0].length, match.index + match[0].length + 600);
-      const methodMatch = tail.match(/\b(?:public|private|protected)\s+[^;{=]*?\s+(\w+)\s*\(/);
+      const methodMatch = tail.match(/\bfun\s+(\w+)\s*\(|\b(?:public|private|protected)\s+[^;{=]*?\s+(\w+)\s*\(/);
       if (methodMatch) {
         references.push({
           fromNodeId: routeNode.id,
-          referenceName: methodMatch[1]!,
+          referenceName: (methodMatch[1] ?? methodMatch[2])!,
           referenceKind: 'references',
           line,
           column: 0,
           filePath,
-          language: 'java',
+          language: lang,
         });
       }
     }
@@ -183,8 +187,8 @@ export const springResolver: FrameworkResolver = {
     while ((match = reqRe.exec(safe)) !== null) {
       const args = (match[1] || '').replace(/^\(|\)$/g, '');
       const after = safe.slice(match.index + match[0].length, match.index + match[0].length + 600);
-      if (/^\s*(?:@[\w.]+(?:\([^)]*\))?\s*)*(?:public\s+|final\s+|abstract\s+)*class\b/.test(after)) continue; // class-level prefix
-      const methodMatch = after.match(/\b(?:public|private|protected)\s+[^;{=]*?\s+(\w+)\s*\(/);
+      if (/^\s*(?:@[\w.]+(?:\([^)]*\))?\s*)*(?:public\s+|final\s+|abstract\s+|open\s+|data\s+|sealed\s+)*class\b/.test(after)) continue; // class-level prefix
+      const methodMatch = after.match(/\bfun\s+(\w+)\s*\(|\b(?:public|private|protected)\s+[^;{=]*?\s+(\w+)\s*\(/);
       if (!methodMatch) continue;
       const verbM = args.match(/method\s*=\s*(?:RequestMethod\.)?(\w+)/);
       const method = verbM ? verbM[1]!.toUpperCase() : 'ANY';
@@ -195,14 +199,14 @@ export const springResolver: FrameworkResolver = {
         kind: 'route',
         name: `${method} ${routePath}`,
         qualifiedName: `${filePath}::route:${routePath}`,
-        filePath, startLine: line, endLine: line, startColumn: 0, endColumn: match[0].length, language: 'java', updatedAt: now,
+        filePath, startLine: line, endLine: line, startColumn: 0, endColumn: match[0].length, language: lang, updatedAt: now,
       };
       nodes.push(routeNode);
       references.push({
         fromNodeId: routeNode.id,
-        referenceName: methodMatch[1]!,
+        referenceName: (methodMatch[1] ?? methodMatch[2])!,
         referenceKind: 'references',
-        line, column: 0, filePath, language: 'java',
+        line, column: 0, filePath, language: lang,
       });
     }
 
